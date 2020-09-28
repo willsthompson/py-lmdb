@@ -24,6 +24,7 @@
 
 /* Include order matters! */
 #include "Python.h"
+#include "numpy/arrayobject.h"
 
 /* Search lib/win32 first, then fallthrough to <stdint.h> as required.*/
 #include "stdint.h"
@@ -2095,7 +2096,21 @@ static PyObject *
 cursor_value(CursorObject *self);
 
 /**
- * Cursor.getmulti() -> Iterable of (key, value)
+ * Helper for resizing Cursor.getmulti()'s PyArray
+ */
+PyObject*
+resize_pyarray(PyObject *pyarr, npy_intp newsize)
+{
+    npy_intp pyarr_cols;
+    PyArray_Dims newshape;
+    npy_intp dims[2] = { newsize, 1 };
+    newshape.ptr = dims;
+    newshape.len = 2;
+    return PyArray_Resize((PyArrayObject *)pyarr, &newshape, 1, NPY_ANYORDER);
+}
+
+/**
+ * Cursor.getmulti() -> Iterable of (key, value) OR Numpy structured array
  */
 static PyObject *
 cursor_get_multi(CursorObject *self, PyObject *args, PyObject *kwds)
@@ -2103,19 +2118,29 @@ cursor_get_multi(CursorObject *self, PyObject *args, PyObject *kwds)
     struct cursor_get {
         PyObject *keys;
         int dupdata;
-        int dupfixed_bytes;
-    } arg = {Py_None, 0, 0};
+        size_t dupfixed_bytes;
+        size_t key_bytes;
+    } arg = {Py_None, 0, 0, 0};
 
     int i, as_buffer;
     PyObject *iter, *item, *tup, *key, *val;
-    PyObject *ret = PyList_New(0);
+    PyObject *pylist = PyList_New(0);
     MDB_cursor_op get_op, next_op;
     bool done;
+
+    // Numpy vars
+    bool ret_numpy;
+    npy_intp pyarr_pos = 0, pyarr_len = 8;
+    Py_ssize_t key_bytes, val_bytes;
+    char key_type[5], val_type[5];
+    PyArray_Descr *descr;
+    PyObject *op, *pyarr;
 
     static const struct argspec argspec[] = {
         {"keys", ARG_OBJ, OFFSET(cursor_get, keys)},
         {"dupdata", ARG_BOOL, OFFSET(cursor_get, dupdata)},
-        {"dupfixed_bytes", ARG_INT, OFFSET(cursor_get, dupfixed_bytes)}  // ARG_SIZE?
+        {"dupfixed_bytes", ARG_SIZE, OFFSET(cursor_get, dupfixed_bytes)},
+        {"key_bytes", ARG_SIZE, OFFSET(cursor_get, key_bytes)}
     };
 
     static PyObject *cache = NULL;
@@ -2144,9 +2169,20 @@ cursor_get_multi(CursorObject *self, PyObject *args, PyObject *kwds)
 
     as_buffer = self->trans->flags & TRANS_BUFFERS;
 
+    // Init Numpy array
+    ret_numpy = arg.key_bytes > 0;
+    key_bytes = arg.key_bytes;
+    val_bytes = arg.dupfixed_bytes;
+    sprintf(key_type, "S%i", key_bytes);
+    sprintf(val_type, "S%i", val_bytes);
+    op = Py_BuildValue("[(s,s),(s,s)]", "key", key_type, "val", val_type);
+    PyArray_DescrConverter(op, &descr);
+    Py_DECREF(op);
+    npy_intp dims[2] = { pyarr_len, 1 };
+    pyarr = (PyArrayObject*) PyArray_SimpleNewFromDescr(2, dims, descr);
+
     while((item = PyIter_Next(iter))) {
         MDB_val mkey;
-
         // validate item?
 
         if(val_from_buffer(&mkey, item)) {
@@ -2186,7 +2222,7 @@ cursor_get_multi(CursorObject *self, PyObject *args, PyObject *kwds)
                     if (tup && key && val) {
                         PyTuple_SET_ITEM(tup, 0, key);
                         PyTuple_SET_ITEM(tup, 1, val);
-                        PyList_Append(ret, tup);
+                        PyList_Append(pylist, tup);
                         Py_DECREF(tup);
                     } else {
                         Py_DECREF(key);
@@ -2195,23 +2231,38 @@ cursor_get_multi(CursorObject *self, PyObject *args, PyObject *kwds)
                     }
                 } else {
                     /* dupfixed, MDB_GET_MULTIPLE returns batch, iterate values */
-                    int len = (int) self->val.mv_size/arg.dupfixed_bytes; // size_t?
-                    for(i=0; i<len; i++){
+                    int items = (int) self->val.mv_size/arg.dupfixed_bytes; // size_t?
+                    for(i=0; i<items; i++){
                         // TODO Handle as_buffer?
-                        val = PyBytes_FromStringAndSize(
-                            (char *) self->val.mv_data+(i*arg.dupfixed_bytes),
-                            (Py_ssize_t) arg.dupfixed_bytes);
-                        tup = PyTuple_New(2);
+                        char *val_data = self->val.mv_data + (i * arg.dupfixed_bytes);
 
-                        if (tup && key && val) {
-                            Py_INCREF(key); // Hold key in loop
-                            PyTuple_SET_ITEM(tup, 0, key);
-                            PyTuple_SET_ITEM(tup, 1, val);
-                            PyList_Append(ret, tup);
-                            Py_DECREF(tup);
+                        if (ret_numpy) {
+                            /* NumPy array */
+                            if (pyarr_pos > pyarr_len - 1) { // Grow array
+                                pyarr_len = pyarr_len * 2;
+                                resize_pyarray(pyarr, pyarr_len);
+                            }
+                            char *k = PyArray_GETPTR1(pyarr, pyarr_pos);
+                            char *v = k + arg.key_bytes;
+                            memcpy(k, self->key.mv_data, arg.key_bytes);
+                            memcpy(v, val_data, arg.dupfixed_bytes);
+
+                            pyarr_pos++;
                         } else {
-                            Py_DECREF(val);
-                            Py_DECREF(tup);
+                            /* List of tuples */
+                            val = PyBytes_FromStringAndSize(val_data, val_bytes);
+                            tup = PyTuple_New(2);
+
+                            if (tup && key && val) {
+                                Py_INCREF(key); // Hold key in loop
+                                PyTuple_SET_ITEM(tup, 0, key);
+                                PyTuple_SET_ITEM(tup, 1, val);
+                                PyList_Append(pylist, tup);
+                                Py_DECREF(tup);
+                            } else {
+                                Py_DECREF(val);
+                                Py_DECREF(tup);
+                            }
                         }
                     }
                     Py_DECREF(key); // Release key
@@ -2237,7 +2288,14 @@ cursor_get_multi(CursorObject *self, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
-    return ret;
+    if (ret_numpy){
+        resize_pyarray(pyarr, pyarr_pos); // Trim array
+        Py_DECREF(pylist);
+        return pyarr;
+    } else {
+        Py_DECREF(pyarr);
+        return pylist;
+    }
 }
 
 /**
@@ -3987,6 +4045,8 @@ MODINIT_NAME(void)
         MOD_RETURN(NULL);
     }
     Py_DECREF(__all__);
+
+    import_array();
 
     MOD_RETURN(mod);
 }

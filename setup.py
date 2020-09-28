@@ -27,6 +27,7 @@ import os
 import sys
 import shutil
 import platform
+import numpy as np
 
 from setuptools import Extension
 from setuptools import setup
@@ -63,7 +64,7 @@ if os.getenv('LMDB_LIBDIR'):
 else:
     extra_library_dirs = []
 
-extra_include_dirs += ['lib/py-lmdb']
+extra_include_dirs += ['lib/py-lmdb', np.get_include()]
 extra_compile_args = []
 
 patch_lmdb_source = False
