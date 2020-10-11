@@ -2269,7 +2269,9 @@ cursor_get_multi(CursorObject *self, PyObject *args, PyObject *kwds)
     if (key_bytes){
         size_t newsize = buffer_pos * item_size;
         buffer = realloc(buffer, newsize);
-        return PyByteArray_FromStringAndSize(buffer, (Py_ssize_t)newsize);
+        Py_buffer pybuf;
+        int rc = PyBuffer_FillInfo(&pybuf, NULL, buffer, newsize, 0, PyBUF_SIMPLE);
+        return PyMemoryView_FromBuffer(&pybuf);
     } else {
         return pylist;
     }
